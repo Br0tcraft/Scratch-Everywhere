@@ -27,13 +27,15 @@
 #include <emscripten.h>
 #endif
 
+std::vector<Block *> Scratch::blocks;
 std::vector<Sprite *> Scratch::sprites;
+std::vector<std::pair<Sprite *, Sprite *>> Scratch::pendingSprites;
 Sprite *Scratch::stageSprite;
-std::vector<std::string> Scratch::broadcastQueue;
-std::vector<std::string> Scratch::backdropQueue;
-std::vector<Sprite *> Scratch::cloneQueue;
 std::string Scratch::answer;
 ProjectType Scratch::projectType;
+
+std::vector<BlockState *> Pools::states;
+std::vector<ScriptThread *> Pools::threads;
 
 BlockExecutor executor;
 
@@ -53,6 +55,7 @@ double Scratch::counter = 0;
 
 bool Scratch::nextProject = false;
 Value Scratch::dataNextProject;
+std::string Scratch::newBroadcast;
 
 bool Scratch::useCustomUsername = false;
 std::string Scratch::customUsername;
@@ -82,10 +85,7 @@ bool Scratch::startScratchProject() {
         if (!forceRedraw || checkFPS) {
             forceRedraw = false;
             if (checkFPS) Input::getInput();
-            BlockExecutor::runCloneStarts();
-            BlockExecutor::runBroadcasts();
-            BlockExecutor::runBackdrops();
-            BlockExecutor::runRepeatBlocks();
+            BlockExecutor::runThreads();
             BlockExecutor::updateMonitors();
             SpeechManager *speechManager = Render::getSpeechManager();
             if (speechManager) {
@@ -156,8 +156,7 @@ void Scratch::cleanupScratchProject() {
 
     // Reset Runtime
 
-    broadcastQueue.clear();
-    cloneQueue.clear();
+    blocks.clear();
     stageSprite = nullptr;
     answer.clear();
     customUsername.clear();
@@ -181,6 +180,66 @@ void Scratch::cleanupScratchProject() {
     Log::log("Cleaned up Scratch project.");
 }
 
+bool Scratch::getInput(Block *block, std::string inputName, ScriptThread *thread, Sprite *sprite, Value &outValue) {
+    if (block->inputs.find(inputName) == block->inputs.end()) {
+        if (block->fields.find(inputName) != block->fields.end()) {
+            outValue = Value(block->fields[inputName].value);
+            return true;
+        }
+        Log::logError("getInput: input '" + inputName + "' not found in block");
+        return true;
+    }
+    ParsedInput &input = block->inputs.at(inputName);
+    switch (input.inputType) {
+    case ParsedInput::InputType::VALUE:
+        outValue = input.value;
+        return true;
+    case ParsedInput::InputType::VARIABLE:
+        if (input.calculated) {
+            outValue = input.value;
+            return true;
+        }
+        input.calculated = true;
+        input.value = BlockExecutor::getVariableValue(input.variableId, sprite);
+        outValue = input.value;
+        return true;
+    case ParsedInput::InputType::BLOCK: {
+        if (input.calculated) {
+            outValue = input.value;
+            return true;
+        };
+        if (input.block == nullptr) {
+            return true;
+        }
+        Block *targetBlock = input.block;
+        input.value = Value();
+
+        BlockResult res = targetBlock->blockFunction(targetBlock, thread, sprite, &(input.value));
+        if (res != BlockResult::REPEAT) {
+            input.calculated = true;
+            outValue = input.value;
+            return true;
+        }
+        return false;
+        return true;
+    }
+    }
+
+    return true;
+};
+
+void Scratch::resetInput(Block *block, std::string inputName) {
+    if (inputName.empty()) {
+        for (auto &[name, input] : block->inputs) {
+            input.calculated = false;
+        }
+        return;
+    }
+    if (block->inputs.find(inputName) == block->inputs.end()) return;
+    ParsedInput &input = block->inputs.at(inputName);
+    input.calculated = false;
+}
+
 void Scratch::greenFlagClicked() {
     stopClicked();
     answer.clear();
@@ -188,15 +247,13 @@ void Scratch::greenFlagClicked() {
     BlockExecutor::runAllBlocksByOpcode("event_whenflagclicked");
 }
 
-void Scratch::stopClicked() {
+void Scratch::stopClicked() { // TODO: FIX
     Scratch::cloneCount = 0;
-    backdropQueue.clear();
-    broadcastQueue.clear();
-    cloneQueue.clear();
     std::vector<Sprite *> toDelete;
     for (Sprite *currentSprite : Scratch::sprites) {
-        for (auto &[id, chain] : currentSprite->blockChains) {
-            chain.blocksToRepeat.clear();
+        for (auto &thread : currentSprite->threads) {
+            thread->clear();
+            Pools::threads.push_back(thread);
         }
         if (Render::getSpeechManager()) {
             Render::getSpeechManager()->clearSpeech(currentSprite);
@@ -215,9 +272,6 @@ void Scratch::stopClicked() {
         delete spr;
         Scratch::sprites.erase(std::remove(Scratch::sprites.begin(), Scratch::sprites.end(), spr),
                                Scratch::sprites.end());
-    }
-    for (unsigned int i = 0; i < Scratch::sprites.size(); i++) {
-        Scratch::sprites[i]->layer = (Scratch::sprites.size() - 1) - i;
     }
 }
 
@@ -613,6 +667,16 @@ void Scratch::sortSprites() {
         sprite->layer = currentLayer--;
 }
 
+void Scratch::addCloneBehind(Sprite *original, Sprite *clone) {
+    auto it = std::find(sprites.begin(), sprites.end(), original);
+
+    if (it != sprites.end()) {
+        sprites.insert(it, clone);
+    } else {
+        sprites.push_back(clone);
+    }
+}
+
 void Scratch::loadCurrentCostumeImage(Sprite *sprite) {
     const std::string &costumeName = sprite->costumes[sprite->currentCostume].fullName;
 
@@ -667,70 +731,25 @@ void Scratch::freeUnusedCostumeImages() {
     }
 }
 
-Block *Scratch::findBlock(std::string blockId, Sprite *sprite) {
-    auto block = sprite->blocks.find(blockId);
-    if (block == sprite->blocks.end()) {
-        return nullptr;
-    }
-    return &block->second;
-}
-
-Block *Scratch::getBlockParent(const Block *block, Sprite *sprite) {
-    Block *parentBlock;
-    const Block *currentBlock = block;
-    while (currentBlock->parent != "null") {
-        parentBlock = findBlock(currentBlock->parent, sprite);
-        if (parentBlock != nullptr) {
-            currentBlock = parentBlock;
-        } else {
-            break;
-        }
-    }
-    return const_cast<Block *>(currentBlock);
-}
-
-Value Scratch::getInputValue(Block &block, const std::string &inputName, Sprite *sprite) {
-    auto parsedFind = block.parsedInputs->find(inputName);
-
-    if (parsedFind == block.parsedInputs->end()) {
-        return Value(0.0);
-    }
-
-    const ParsedInput &input = parsedFind->second;
-    switch (input.inputType) {
-
-    case ParsedInput::LITERAL:
-        return input.literalValue;
-
-    case ParsedInput::VARIABLE:
-        return BlockExecutor::getVariableValue(input.variableId, sprite);
-
-    case ParsedInput::BLOCK:
-        return executor.getBlockValue(*findBlock(input.blockId, sprite), sprite);
-    }
-
-    return Value();
-}
-
 std::string Scratch::getFieldValue(Block &block, const std::string &fieldName) {
-    auto fieldFind = block.parsedFields->find(fieldName);
-    if (fieldFind == block.parsedFields->end()) {
+    auto fieldFind = block.fields.find(fieldName);
+    if (fieldFind == block.fields.end()) {
         return "";
     }
     return fieldFind->second.value;
 }
 
 std::string Scratch::getFieldId(Block &block, const std::string &fieldName) {
-    auto fieldFind = block.parsedFields->find(fieldName);
-    if (fieldFind == block.parsedFields->end()) {
+    auto fieldFind = block.fields.find(fieldName);
+    if (fieldFind == block.fields.end()) {
         return "";
     }
     return fieldFind->second.id;
 }
 
 std::string Scratch::getListName(Block &block) {
-    auto fieldFind = block.parsedFields->find("LIST");
-    if (fieldFind == block.parsedFields->end()) {
+    auto fieldFind = block.fields.find("LIST");
+    if (fieldFind == block.fields.end()) {
         return "";
     }
     return fieldFind->second.value;
